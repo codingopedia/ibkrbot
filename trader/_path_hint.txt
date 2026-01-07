@@ -1,0 +1,4 @@
+If you run into import issues, ensure you run commands from the repo root:
+- python -m trader ...
+or set:
+- export PYTHONPATH=./src

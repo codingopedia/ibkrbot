@@ -1,0 +1,25 @@
+env: live
+log:
+  level: INFO
+  json_logs: true
+  file: run/trader.log
+
+storage:
+  sqlite_path: run/trader.sqlite
+
+runtime:
+  heartbeat_seconds: 2
+
+broker:
+  type: sim
+
+instrument:
+  symbol: MGC
+  exchange: COMEX
+  currency: USD
+  multiplier: 10.0
+
+risk:
+  max_position: 1
+  max_daily_loss_usd: 200.0
+  max_order_size: 1

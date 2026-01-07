@@ -1,0 +1,5 @@
+typer>=0.12
+PyYAML>=6.0
+pydantic>=2.5
+python-json-logger>=2.0
+ib-insync>=0.9.86
