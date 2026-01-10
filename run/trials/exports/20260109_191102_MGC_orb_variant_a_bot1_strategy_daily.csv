@@ -1,0 +1,2 @@
+day,symbol,strategy,timezone,range_start,range_end,entry_start,entry_end,range_high,range_low,range_bars,signals_count,entries_count,exits_count,trades_closed_count,notes_json
+2026-01-09,MGC,orb_variant_a,UTC,00:00,05:00,07:00,10:00,,,0,0,0,0,0,

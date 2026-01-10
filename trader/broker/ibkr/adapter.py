@@ -1,16 +1,32 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
-from typing import Callable, Dict, Optional, Set, Tuple
+import time
+from collections import deque
+from datetime import datetime, timezone
+from typing import Callable, Deque, Dict, Optional, Set, Tuple
 import uuid
 
-from ib_insync import IB, Future, LimitOrder, MarketOrder, Ticker
+from ib_insync import IB, BarData, Future, LimitOrder, MarketOrder, Ticker
 
 from trader.broker.base import Broker
-from trader.config import InstrumentConfig
-from trader.events import Fill, MarketEvent, OrderAck, OrderIntent, OrderStatusUpdate
+from trader.config import DataConfig, InstrumentConfig, OrderConfig
+from trader.events import BarEvent, Fill, MarketEvent, OrderAck, OrderIntent, OrderStatusUpdate
+from trader.market_data import normalize_price
 from trader.models import Position
+
+
+def classify_ibkr_event(error_code: int, error_string: str) -> int:
+    """Map IBKR error codes to logging levels."""
+    ok_codes = {2104, 2106, 2158}
+    info_codes = ok_codes | {1101, 1102}
+    warning_codes = {10349, 1100}
+
+    if error_code in info_codes:
+        return logging.INFO
+    if error_code in warning_codes:
+        return logging.WARNING
+    return logging.ERROR
 
 
 class IBKRBroker(Broker):
@@ -22,7 +38,11 @@ class IBKRBroker(Broker):
         port: int = 7497,
         client_id: int = 1,
         market_data_type: int = 3,
+        connect_timeout_seconds: int = 20,
         instrument: Optional[InstrumentConfig] = None,
+        orders: Optional[OrderConfig] = None,
+        data: Optional[DataConfig] = None,
+        instance_id: str = "bot1",
     ) -> None:
         self._log = logging.getLogger("broker.ibkr")
         self.host = host
@@ -30,6 +50,10 @@ class IBKRBroker(Broker):
         self.client_id = client_id
         self.market_data_type = market_data_type  # 1=live, 2=frozen, 3=delayed, 4=delayed-frozen
         self._instrument = instrument
+        self._orders = orders or OrderConfig()
+        self._data = data or DataConfig()
+        self._instance_id = instance_id or "bot1"
+        self.connect_timeout_seconds = connect_timeout_seconds
 
         self._connected = False
         self._ib: Optional[IB] = None
@@ -41,6 +65,17 @@ class IBKRBroker(Broker):
         self._broker_to_client: Dict[str, str] = {}
         self._seen_status_keys: Set[Tuple[str, str, float]] = set()
         self._seen_commission_ids: Set[str] = set()
+        self._recent_errors: Deque[dict] = deque(maxlen=50)
+        self._error_cb: Optional[Callable[..., None]] = None
+        self._bars_cb: Optional[Callable[[BarEvent], None]] = None
+        self._bars_subscription: Optional[object] = None
+        self._bars_handler: Optional[Callable[[object], None]] = None
+        self._last_bar_ts: Optional[str] = None
+        self._seen_bar_keys: Set[Tuple[str, str]] = set()
+        self._bar_snapshot_limit: int = 500
+        self._bar_poll_contract: Optional[Future] = None
+        self._last_bar_poll: float = 0.0
+        self._bar_poll_interval: float = 5.0
 
     def _ensure_connected(self) -> IB:
         if not self._connected or self._ib is None:
@@ -49,25 +84,57 @@ class IBKRBroker(Broker):
 
     def connect(self) -> None:
         self._ib = IB()
+        self._recent_errors.clear()
+        self._error_cb = self._on_error
+        self._ib.errorEvent += self._error_cb  # type: ignore[assignment]
         try:
-            self._ib.connect(self.host, self.port, clientId=self.client_id)
+            self._ib.connect(self.host, self.port, clientId=self.client_id, timeout=self.connect_timeout_seconds)
         except Exception as exc:  # pragma: no cover - network/IB errors
+            self._detach_error_handler()
             self._log.error(
                 "connect_failed",
-                extra={"host": self.host, "port": self.port, "client_id": self.client_id, "error": str(exc)},
+                extra={
+                    "host": self.host,
+                    "port": self.port,
+                    "client_id": self.client_id,
+                    "timeout": self.connect_timeout_seconds,
+                    "market_data_type": self.market_data_type,
+                    "error": str(exc),
+                },
             )
             raise RuntimeError(f"IBKR connect failed: {exc}") from exc
         if not self._ib.isConnected():
             msg = f"IBKR connect failed: not connected (host={self.host} port={self.port} client_id={self.client_id})"
-            self._log.error("connect_failed", extra={"host": self.host, "port": self.port, "client_id": self.client_id})
+            self._detach_error_handler()
+            self._log.error(
+                "connect_failed",
+                extra={
+                    "host": self.host,
+                    "port": self.port,
+                    "client_id": self.client_id,
+                    "timeout": self.connect_timeout_seconds,
+                    "market_data_type": self.market_data_type,
+                },
+            )
             raise RuntimeError(msg)
         self._ib.reqMarketDataType(self.market_data_type)
         self._connected = True
-        self._log.info("connected", extra={"host": self.host, "port": self.port, "client_id": self.client_id})
+        self._log.info(
+            "connected",
+            extra={
+                "host": self.host,
+                "port": self.port,
+                "client_id": self.client_id,
+                "timeout": self.connect_timeout_seconds,
+                "market_data_type": self.market_data_type,
+            },
+        )
 
     def disconnect(self) -> None:
         if self._ib is None:
             return
+
+        self._detach_error_handler()
 
         if self._ticker is not None:
             try:
@@ -81,6 +148,17 @@ class IBKRBroker(Broker):
                     pass
             self._ticker = None
             self._ticker_cb = None
+
+        if self._bars_subscription is not None and self._bars_handler is not None:
+            try:
+                self._bars_subscription.updateEvent -= self._bars_handler  # type: ignore[operator]
+            except Exception:
+                pass
+        self._bars_subscription = None
+        self._bars_handler = None
+        self._bars_cb = None
+        self._seen_bar_keys.clear()
+        self._bar_poll_contract = None
 
         self._ib.disconnect()
         self._connected = False
@@ -166,9 +244,9 @@ class IBKRBroker(Broker):
         ticker = ib.reqMktData(contract, "", False, False)
 
         def _on_update(_: Ticker) -> None:
-            bid = float(ticker.bid) if ticker.bid is not None else None
-            ask = float(ticker.ask) if ticker.ask is not None else None
-            last = float(ticker.last) if ticker.last is not None else None
+            bid = normalize_price(ticker.bid)
+            ask = normalize_price(ticker.ask)
+            last = normalize_price(ticker.last)
             evt = MarketEvent(ts=datetime.utcnow(), symbol=symbol, bid=bid, ask=ask, last=last)
             on_event(evt)
 
@@ -177,9 +255,98 @@ class IBKRBroker(Broker):
         self._ticker_cb = _on_update
         self._log.info("market_data_subscribed", extra={"symbol": symbol, "conId": contract.conId})
 
+    def subscribe_bars(self, symbol: str, on_bar: Callable[[BarEvent], None]) -> None:
+        ib = self._ensure_connected()
+        if self._bars_cb is not None:
+            return
+        contract = self._resolve_contract()
+        self._bars_cb = on_bar
+        self._last_bar_ts = None
+        self._seen_bar_keys.clear()
+        self._bar_poll_contract = None
+        snapshot_bars = []
+        try:
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr=self._data.duration,
+                barSizeSetting=self._data.bar_size,
+                whatToShow="TRADES",
+                useRTH=self._data.use_rth,
+                formatDate=1,
+                keepUpToDate=True,
+            )
+            self._bars_subscription = bars
+            snapshot_bars = list(bars)
+
+            def _on_update(_bars: object, _has_new_bar: object = None) -> None:
+                if not bars:
+                    return
+                self._emit_bar(symbol, bars[-1])
+
+            bars.updateEvent += _on_update  # type: ignore[operator]
+            self._bars_handler = _on_update
+            self._log.info(
+                "bars_subscribed",
+                extra={
+                    "symbol": symbol,
+                    "bar_size": self._data.bar_size,
+                    "duration": self._data.duration,
+                    "use_rth": self._data.use_rth,
+                },
+            )
+        except TypeError:
+            # keepUpToDate not supported; fallback to polling.
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr=self._data.duration,
+                barSizeSetting=self._data.bar_size,
+                whatToShow="TRADES",
+                useRTH=self._data.use_rth,
+                formatDate=1,
+                keepUpToDate=False,
+            )
+            snapshot_bars = list(bars) if bars else []
+            self._bar_poll_contract = contract
+            self._log.info(
+                "bars_polling_enabled",
+                extra={
+                    "symbol": symbol,
+                    "bar_size": self._data.bar_size,
+                    "duration": self._data.duration,
+                    "use_rth": self._data.use_rth,
+                    "interval": self._bar_poll_interval,
+                },
+            )
+        self._emit_bars_snapshot(symbol, snapshot_bars)
+
+    def poll_bars(self) -> None:
+        if self._bar_poll_contract is None or self._bars_cb is None or self._ib is None:
+            return
+        now = time.time()
+        if now - self._last_bar_poll < self._bar_poll_interval:
+            return
+        self._last_bar_poll = now
+        bars = self._ib.reqHistoricalData(
+            self._bar_poll_contract,
+            endDateTime="",
+            durationStr=self._data.duration,
+            barSizeSetting=self._data.bar_size,
+            whatToShow="TRADES",
+            useRTH=self._data.use_rth,
+            formatDate=1,
+            keepUpToDate=False,
+        )
+        if bars:
+            self._emit_bar(self._bar_poll_contract.symbol, bars[-1])
+
     def place_order(self, intent: OrderIntent) -> OrderAck:
         ib = self._ensure_connected()
         contract = self._resolve_contract()
+
+        tif = self._orders.default_tif
+        outside_rth = bool(self._orders.outside_rth)
 
         if intent.order_type == "MKT":
             order = MarketOrder(intent.side, intent.qty)
@@ -190,7 +357,22 @@ class IBKRBroker(Broker):
         else:
             raise ValueError(f"Unsupported order type: {intent.order_type}")
 
-        order.orderRef = intent.client_order_id
+        prefix = f"BOT:{self._instance_id}:"
+        order.orderRef = f"{prefix}{intent.client_order_id}"
+        order.tif = tif
+        order.outsideRth = outside_rth
+        self._log.info(
+            "order_submit",
+            extra={
+                "client_order_id": intent.client_order_id,
+                "symbol": intent.symbol,
+                "side": intent.side,
+                "qty": intent.qty,
+                "order_type": intent.order_type,
+                "tif": tif,
+                "outsideRth": outside_rth,
+            },
+        )
         trade = ib.placeOrder(contract, order)
 
         for _ in range(20):
@@ -216,7 +398,8 @@ class IBKRBroker(Broker):
 
         for trade in ib.trades():
             broker_order_id = str(trade.order.orderId)
-            client_order_id = trade.order.orderRef or self._broker_to_client.get(broker_order_id, "")
+            order_ref = trade.order.orderRef or ""
+            client_order_id = self._parse_client_order_id(order_ref)
             for fill in trade.fills:
                 exec_id = fill.execution.execId
                 if exec_id in self._seen_exec_ids:
@@ -251,7 +434,8 @@ class IBKRBroker(Broker):
 
         for trade in ib.trades():
             broker_order_id = str(trade.order.orderId)
-            client_order_id = trade.order.orderRef or self._broker_to_client.get(broker_order_id, "")
+            order_ref = trade.order.orderRef or ""
+            client_order_id = self._parse_client_order_id(order_ref)
             if trade.orderStatus is None:
                 continue
             status = trade.orderStatus.status or ""
@@ -288,9 +472,11 @@ class IBKRBroker(Broker):
                 continue
             ib.cancelOrder(trade.order)
         for order in ib.openOrders():
-            if symbol and getattr(order.contract, "symbol", None) != symbol:
-                continue
-            ib.cancelOrder(order.order)
+            # openOrders returns bare Order objects (no contract); cancel regardless if symbol filter is set.
+            if symbol is None:
+                ib.cancelOrder(order)
+            else:
+                ib.cancelOrder(order)
         self._log.info("cancel_all_orders", extra={"symbol": symbol})
 
     def poll_commissions(self, on_commission: Callable[[str, float], None]) -> None:
@@ -343,6 +529,93 @@ class IBKRBroker(Broker):
     def raw_ib(self) -> IB:
         """Expose underlying IB client for read-only inspection flows (doctor)."""
         return self._ensure_connected()
+
+    def recent_errors(self, limit: int = 5) -> list[dict]:
+        """Return the most recent IBKR error events (up to limit)."""
+        return list(self._recent_errors)[-limit:]
+
+    def _on_error(self, req_id: int, error_code: int, error_string: str, contract: Optional[Future] = None) -> None:
+        level = classify_ibkr_event(error_code, error_string)
+        err = {
+            "ts": datetime.utcnow(),
+            "reqId": req_id,
+            "errorCode": error_code,
+            "errorString": error_string,
+        }
+        if level >= logging.WARNING:
+            self._recent_errors.append(err)
+        self._log.log(level, "ib_event", extra={"reqId": req_id, "errorCode": error_code, "errorString": error_string})
+
+    def _parse_client_order_id(self, order_ref: str) -> str:
+        prefix = f"BOT:{self._instance_id}:"
+        if order_ref.startswith(prefix):
+            return order_ref[len(prefix) :]
+        return "UNKNOWN"
+
+    def _normalize_bar_ts(self, raw_ts: object) -> datetime:
+        ts = raw_ts if isinstance(raw_ts, datetime) else None
+        if ts is None:
+            try:
+                ts = datetime.strptime(str(raw_ts), "%Y%m%d %H:%M:%S")
+            except Exception:
+                ts = datetime.utcnow().replace(tzinfo=timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        else:
+            ts = ts.astimezone(timezone.utc)
+        return ts
+
+    def _bar_event_from_ib(self, symbol: str, bar: BarData, is_snapshot: bool = False) -> Optional[BarEvent]:
+        try:
+            ts = self._normalize_bar_ts(getattr(bar, "date", None))
+            ts_key = ts.isoformat()
+            key = (symbol, ts_key)
+            if key in self._seen_bar_keys:
+                return None
+            self._seen_bar_keys.add(key)
+            self._last_bar_ts = ts_key
+            return BarEvent(
+                ts_utc=ts,
+                symbol=symbol,
+                open=float(bar.open),
+                high=float(bar.high),
+                low=float(bar.low),
+                close=float(bar.close),
+                volume=float(bar.volume),
+                is_snapshot=is_snapshot,
+            )
+        except Exception as exc:
+            self._log.error("bar_parse_failed", extra={"symbol": symbol, "error": str(exc)})
+            return None
+
+    def _emit_bars_snapshot(self, symbol: str, bars: list[BarData]) -> int:
+        if self._bars_cb is None or not bars:
+            return 0
+        emitted = 0
+        for bar in bars[-self._bar_snapshot_limit :]:
+            evt = self._bar_event_from_ib(symbol, bar, is_snapshot=True)
+            if evt is None:
+                continue
+            self._bars_cb(evt)
+            emitted += 1
+        if emitted:
+            self._log.info("bars_snapshot_loaded", extra={"symbol": symbol, "count": emitted})
+        return emitted
+
+    def _emit_bar(self, symbol: str, bar: BarData) -> None:
+        if self._bars_cb is None or bar is None:
+            return
+        evt = self._bar_event_from_ib(symbol, bar)
+        if evt:
+            self._bars_cb(evt)
+
+    def _detach_error_handler(self) -> None:
+        if self._ib and self._error_cb:
+            try:
+                self._ib.errorEvent -= self._error_cb  # type: ignore[assignment]
+            except Exception:
+                pass
+        self._error_cb = None
 
     def contract_candidates(self, limit: int = 5) -> list[Future]:
         """Return nearest contract month candidates for the configured instrument."""

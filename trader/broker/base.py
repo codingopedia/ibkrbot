@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Callable, Optional
 
-from trader.events import Fill, MarketEvent, OrderAck, OrderIntent, OrderStatusUpdate
+from trader.events import BarEvent, Fill, MarketEvent, OrderAck, OrderIntent, OrderStatusUpdate
 from trader.models import Position
 
 
@@ -19,6 +19,12 @@ class Broker(ABC):
 
     @abstractmethod
     def subscribe_market_data(self, symbol: str, on_event: Callable[[MarketEvent], None]) -> None: ...
+
+    @abstractmethod
+    def subscribe_bars(self, symbol: str, on_bar: Callable[[BarEvent], None]) -> None: ...
+
+    @abstractmethod
+    def poll_bars(self) -> None: ...
 
     @abstractmethod
     def poll_fills(self, on_fill: Callable[[Fill], None]) -> None:

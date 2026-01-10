@@ -1,0 +1,1 @@
+trade_id,instance_id,strategy,symbol,entry_ts,entry_price,entry_side,entry_reason,exit_ts,exit_price,exit_reason,qty,pnl_usd,range_high,range_low,risk_per_unit

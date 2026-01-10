@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from trader.events import Fill, OrderIntent
+from trader.events import BarEvent, Fill, OrderIntent
 from trader.models import OrderRecord, PnLSnapshot
 
 
@@ -32,15 +33,22 @@ class Database:
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_exec_id ON fills(exec_id) WHERE exec_id IS NOT NULL"
         )
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS bars_1m (ts TEXT NOT NULL, symbol TEXT NOT NULL, open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL, volume REAL NOT NULL, UNIQUE(symbol, ts))"
+        )
         self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
 
     def insert_fill(self, f: Fill) -> None:
+        if f.exec_id:
+            exists = self.conn.execute("SELECT 1 FROM fills WHERE exec_id=?", (f.exec_id,)).fetchone()
+            if exists:
+                return
         self.conn.execute(
             """
-            INSERT INTO fills(ts, client_order_id, broker_order_id, exec_id, symbol, side, qty, price, commission)
+            INSERT OR IGNORE INTO fills(ts, client_order_id, broker_order_id, exec_id, symbol, side, qty, price, commission)
             VALUES(?,?,?,?,?,?,?,?,?)
             """,
             (
@@ -134,6 +142,30 @@ class Database:
         self.conn.commit()
         return cur.rowcount > 0
 
+    def upsert_bar(self, bar: BarEvent) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO bars_1m(ts, symbol, open, high, low, close, volume)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(symbol, ts) DO UPDATE SET
+                open=excluded.open,
+                high=excluded.high,
+                low=excluded.low,
+                close=excluded.close,
+                volume=excluded.volume
+            """,
+            (
+                bar.ts_utc.isoformat(),
+                bar.symbol,
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.volume,
+            ),
+        )
+        self.conn.commit()
+
     def get_open_orders(self) -> list[OrderRecord]:
         rows = self.conn.execute(
             """
@@ -157,3 +189,231 @@ class Database:
             )
             for row in rows
         ]
+
+    def insert_signal(
+        self,
+        *,
+        ts: datetime,
+        symbol: str,
+        strategy: str,
+        type: str,
+        side: Optional[str] = None,
+        qty: Optional[int] = None,
+        reason: str = "",
+        price_ref: Optional[float] = None,
+        bar_ts: Optional[datetime] = None,
+        is_snapshot: bool = False,
+        extras: Optional[dict] = None,
+    ) -> None:
+        extras_json = json.dumps(extras or {}, ensure_ascii=True)
+        self.conn.execute(
+            """
+            INSERT INTO strategy_signals(ts, symbol, strategy, type, side, qty, reason, price_ref, bar_ts, is_snapshot, extras_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                ts.isoformat(),
+                symbol,
+                strategy,
+                type,
+                side,
+                qty,
+                reason,
+                price_ref,
+                bar_ts.isoformat() if bar_ts else None,
+                1 if is_snapshot else 0,
+                extras_json,
+            ),
+        )
+        self.conn.commit()
+
+    def upsert_trade(
+        self,
+        *,
+        trade_id: str,
+        instance_id: str,
+        strategy: str,
+        symbol: str,
+        entry_ts: Optional[datetime],
+        entry_price: Optional[float],
+        entry_side: Optional[str],
+        entry_reason: Optional[str],
+        exit_ts: Optional[datetime],
+        exit_price: Optional[float],
+        exit_reason: Optional[str],
+        qty: Optional[int],
+        pnl_usd: Optional[float],
+        range_high: Optional[float],
+        range_low: Optional[float],
+        risk_per_unit: Optional[float],
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO trade_journal(trade_id, instance_id, strategy, symbol, entry_ts, entry_price, entry_side, entry_reason, exit_ts, exit_price, exit_reason, qty, pnl_usd, range_high, range_low, risk_per_unit)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(trade_id) DO UPDATE SET
+                instance_id=excluded.instance_id,
+                strategy=excluded.strategy,
+                symbol=excluded.symbol,
+                entry_ts=excluded.entry_ts,
+                entry_price=excluded.entry_price,
+                entry_side=excluded.entry_side,
+                entry_reason=excluded.entry_reason,
+                exit_ts=excluded.exit_ts,
+                exit_price=excluded.exit_price,
+                exit_reason=excluded.exit_reason,
+                qty=excluded.qty,
+                pnl_usd=excluded.pnl_usd,
+                range_high=excluded.range_high,
+                range_low=excluded.range_low,
+                risk_per_unit=excluded.risk_per_unit
+            """,
+            (
+                trade_id,
+                instance_id,
+                strategy,
+                symbol,
+                entry_ts.isoformat() if entry_ts else None,
+                entry_price,
+                entry_side,
+                entry_reason,
+                exit_ts.isoformat() if exit_ts else None,
+                exit_price,
+                exit_reason,
+                qty,
+                pnl_usd,
+                range_high,
+                range_low,
+                risk_per_unit,
+            ),
+        )
+        self.conn.commit()
+
+    def upsert_trade_metrics(
+        self, *, trade_id: str, duration_seconds: Optional[float], mfe: Optional[float], mae: Optional[float], r_multiple: Optional[float]
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO trade_metrics(trade_id, duration_seconds, mfe, mae, r_multiple)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(trade_id) DO UPDATE SET
+                duration_seconds=excluded.duration_seconds,
+                mfe=excluded.mfe,
+                mae=excluded.mae,
+                r_multiple=excluded.r_multiple
+            """,
+            (trade_id, duration_seconds, mfe, mae, r_multiple),
+        )
+        self.conn.commit()
+
+    def upsert_trade_shadow(
+        self, *, trade_id: str, variant_name: str, exit_ts: Optional[datetime], exit_price: Optional[float], pnl_usd: Optional[float], reason_exit: str
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO trade_shadow(trade_id, variant_name, exit_ts, exit_price, pnl_usd, reason_exit)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(trade_id, variant_name) DO UPDATE SET
+                exit_ts=excluded.exit_ts,
+                exit_price=excluded.exit_price,
+                pnl_usd=excluded.pnl_usd,
+                reason_exit=excluded.reason_exit
+            """,
+            (
+                trade_id,
+                variant_name,
+                exit_ts.isoformat() if exit_ts else None,
+                exit_price,
+                pnl_usd,
+                reason_exit,
+            ),
+        )
+        self.conn.commit()
+
+    def get_bars_between(self, symbol: str, start: datetime, end: datetime) -> list[BarEvent]:
+        rows = self.conn.execute(
+            """
+            SELECT ts, open, high, low, close, volume FROM bars_1m
+            WHERE symbol = ? AND ts >= ? AND ts <= ?
+            ORDER BY ts ASC
+            """,
+            (symbol, start.isoformat(), end.isoformat()),
+        ).fetchall()
+        result: list[BarEvent] = []
+        for row in rows:
+            try:
+                ts = datetime.fromisoformat(row["ts"])
+            except Exception:
+                continue
+            result.append(
+                BarEvent(
+                    ts_utc=ts,
+                    symbol=symbol,
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    volume=float(row["volume"]),
+                )
+            )
+        return result
+
+    def upsert_strategy_daily(
+        self,
+        *,
+        day: str,
+        symbol: str,
+        strategy: str,
+        timezone: str,
+        range_start: Optional[str],
+        range_end: Optional[str],
+        entry_start: Optional[str],
+        entry_end: Optional[str],
+        range_high: Optional[float],
+        range_low: Optional[float],
+        range_bars: int,
+        signals_count: int,
+        entries_count: int,
+        exits_count: int,
+        trades_closed_count: int,
+        notes_json: Optional[str],
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO strategy_daily(day, symbol, strategy, timezone, range_start, range_end, entry_start, entry_end, range_high, range_low, range_bars, signals_count, entries_count, exits_count, trades_closed_count, notes_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(day, symbol, strategy) DO UPDATE SET
+                timezone=excluded.timezone,
+                range_start=excluded.range_start,
+                range_end=excluded.range_end,
+                entry_start=excluded.entry_start,
+                entry_end=excluded.entry_end,
+                range_high=excluded.range_high,
+                range_low=excluded.range_low,
+                range_bars=excluded.range_bars,
+                signals_count=excluded.signals_count,
+                entries_count=excluded.entries_count,
+                exits_count=excluded.exits_count,
+                trades_closed_count=excluded.trades_closed_count,
+                notes_json=excluded.notes_json
+            """,
+            (
+                day,
+                symbol,
+                strategy,
+                timezone,
+                range_start,
+                range_end,
+                entry_start,
+                entry_end,
+                range_high,
+                range_low,
+                range_bars,
+                signals_count,
+                entries_count,
+                exits_count,
+                trades_closed_count,
+                notes_json,
+            ),
+        )
+        self.conn.commit()

@@ -9,41 +9,14 @@ storage:
 
 runtime:
   heartbeat_seconds: 2
-  instance_id: bot1
-
-trading:
-  enabled: false
-  allow_live: false
-
-strategy:
-  type: noop
-
-backtest:
-  fill_model: next_open
-  commission_per_contract_usd: 1.0
-  slippage_ticks: 0
-  min_tick: 0.1
-
-data:
-  bars_enabled: true
-  bar_size: "1 min"
-  duration: "1 D"
-  use_rth: false
 
 broker:
   type: ibkr
   ibkr:
     host: 127.0.0.1
-    port: 4002
+    port: 7497
     client_id: 7
     market_data_type: 3
-
-orders:
-  default_tif: DAY
-  outside_rth: false
-
-reconcile:
-  unknown_orders_policy: HALT
 
 instrument:
   symbol: MGC

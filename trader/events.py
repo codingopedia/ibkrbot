@@ -15,6 +15,18 @@ class MarketEvent:
 
 
 @dataclass(frozen=True)
+class BarEvent:
+    ts_utc: datetime
+    symbol: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    is_snapshot: bool = False
+
+
+@dataclass(frozen=True)
 class Signal:
     ts: datetime
     symbol: str

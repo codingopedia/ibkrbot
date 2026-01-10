@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
 import uuid
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
 from trader.broker.base import Broker
-from trader.events import Fill, MarketEvent, OrderAck, OrderIntent, OrderStatusUpdate
+from trader.events import BarEvent, Fill, MarketEvent, OrderAck, OrderIntent, OrderStatusUpdate
 from trader.models import Position
 
 
@@ -27,6 +28,9 @@ class SimBroker(Broker):
         self._broker_order_map: Dict[str, str] = {}
         self._seen_status_keys: set[str] = set()
         self._positions: Dict[str, Position] = {}
+        self._bar_cb: Optional[Callable[[BarEvent], None]] = None
+        self._bar_symbol: Optional[str] = None
+        self._last_bar_ts: Optional[datetime] = None
 
     def connect(self) -> None:
         self._connected = True
@@ -64,14 +68,38 @@ class SimBroker(Broker):
             raise RuntimeError("SimBroker not connected")
 
         # Generate a few ticks synchronously (MVP).
-        import random
-
         for _ in range(5):
             self._last += random.uniform(-0.5, 0.5)
             bid = self._last - 0.1
             ask = self._last + 0.1
             on_event(MarketEvent(ts=datetime.utcnow(), symbol=symbol, bid=bid, ask=ask, last=self._last))
             time.sleep(0.1)
+
+    def subscribe_bars(self, symbol: str, on_bar: Callable[[BarEvent], None]) -> None:
+        if not self._connected:
+            raise RuntimeError("SimBroker not connected")
+        if self._bar_cb is not None:
+            return
+        self._bar_cb = on_bar
+        self._bar_symbol = symbol
+        self._log.info("bars_subscribed_sim", extra={"symbol": symbol})
+
+    def poll_bars(self) -> None:
+        if not self._connected or not self._bar_cb or not self._bar_symbol:
+            return
+        now = datetime.utcnow()
+        # Emit at most one bar per second
+        if self._last_bar_ts and (now - self._last_bar_ts).total_seconds() < 1.0:
+            return
+        self._last += random.uniform(-0.3, 0.3)
+        o = self._last + random.uniform(-0.1, 0.1)
+        c = self._last
+        high = max(o, c) + random.uniform(0.0, 0.2)
+        low = min(o, c) - random.uniform(0.0, 0.2)
+        vol = abs(random.randint(50, 150))
+        bar = BarEvent(ts_utc=now, symbol=self._bar_symbol, open=o, high=high, low=low, close=c, volume=vol)
+        self._bar_cb(bar)
+        self._last_bar_ts = now
 
     def poll_fills(self, on_fill: Callable[[Fill], None]) -> None:
         # Emit new fills once.

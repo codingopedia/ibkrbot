@@ -5,7 +5,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict
 
-from pythonjsonlogger import jsonlogger
+from pythonjsonlogger.json import JsonFormatter
 
 from trader.config import LogConfig
 
@@ -26,7 +26,7 @@ def setup_logging(cfg: LogConfig) -> None:
     handler.setLevel(level)
 
     if cfg.json:
-        formatter = jsonlogger.JsonFormatter(
+        formatter = JsonFormatter(
             fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
             rename_fields={"asctime": "ts", "levelname": "level", "name": "logger"},
         )

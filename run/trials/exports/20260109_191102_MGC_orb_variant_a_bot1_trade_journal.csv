@@ -1,0 +1,5 @@
+trade_id,instance_id,strategy,symbol,entry_ts,entry_price,entry_side,entry_reason,exit_ts,exit_price,exit_reason,qty,pnl_usd,range_high,range_low,risk_per_unit
+trade-eca8701de2,bot1,orb_variant_a,MGC,2026-01-09T19:10:14.905565,329.99,SELL,,,,,2,,,,
+trade-9c0d868cc6,bot1,orb_variant_a,MGC,2026-01-09T19:10:15.015601,303.86,SELL,,,,,1,,,,
+trade-17785b79af,bot1,orb_variant_a,MGC,2026-01-09T19:10:15.124564,447.52,SELL,,,,,1,,,,
+trade-2f928f449d,bot1,orb_variant_a,MGC,2026-01-09T19:10:15.249821,150.83,SELL,,,,,2,,,,
