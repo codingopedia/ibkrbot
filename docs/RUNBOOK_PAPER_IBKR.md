@@ -45,3 +45,9 @@
 - Optional after a few days: flip `trading.enabled=true` (paper) in a copy of the config; keep `allow_live=false`.
 - Daily routine: (1) run collector (read-only or paper), (2) export CSVs `python -m trader export -c <cfg> --outdir run/exports --days 14`, (3) generate summary `python -m trader report -c <cfg> --days 14` (JSON lands in `run/reports/`).
 - One-click dry trial: `python -m trader trial -c <cfg> --iterations 3600 --outdir run/trials --export-days 14` (refuses to run if `trading.enabled=true`; saves reports to `<outdir>/reports` and CSVs to `<outdir>/exports`).
+
+## COMEX RTH trial (MGC/COMEX, NY time)
+- Window: range 08:20-08:50 ET, entry 08:50-13:00 ET, flat 13:25 ET. Start the trial a few minutes before 08:20 ET (e.g., 08:10 ET) so the range is captured.
+- Config/script: `config\paper.tws.orb_a.comex_rth.local.yaml` with `scripts\run_orb_trial_comex.ps1` (6h run via `--minutes 360`, exports 14d, read-only).
+- Task Scheduler (daily): Create Basic Task "ORB COMEX trial" -> trigger daily at the NY start time (convert to local) -> action `Start a program` = `powershell.exe` with args `-ExecutionPolicy Bypass -File "<repo>\scripts\run_orb_trial_comex.ps1"` and `Start in` = repo root. Enable "Run whether user is logged on or not" if you need unattended runs.
+- Reading `signals=0`: usually means we were outside the entry window or price never broke the range; check preflight output for window status and whether the entry window already passed.

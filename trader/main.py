@@ -6,9 +6,10 @@ import logging
 import sqlite3
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time, timezone
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import typer
 
@@ -573,6 +574,101 @@ def _append_trial_log(message: str) -> None:
         f.write(message + "\n")
 
 
+def _parse_hhmm(value: Optional[str]) -> Optional[dt_time]:
+    if not value:
+        return None
+    try:
+        hour, minute = (int(part) for part in value.split(":"))
+        return dt_time(hour=hour, minute=minute)
+    except Exception:
+        return None
+
+
+def _is_in_window(now_local: datetime, start: Optional[dt_time], end: Optional[dt_time]) -> Optional[bool]:
+    if start is None or end is None:
+        return None
+    t = now_local.timetz().replace(tzinfo=None)
+    return start <= t <= end
+
+
+def _range_built_for_day(db: Database, day: str, symbol: str, strategy: str) -> bool:
+    try:
+        row = db.conn.execute(
+            "SELECT range_high, range_low, range_bars FROM strategy_daily WHERE day=? AND symbol=? AND strategy=?",
+            (day, symbol, strategy),
+        ).fetchone()
+    except Exception:
+        return False
+    if row is None:
+        return False
+    try:
+        return row["range_high"] is not None and row["range_low"] is not None and int(row["range_bars"] or 0) > 0
+    except Exception:
+        return False
+
+
+def _trial_preflight(cfg: AppConfig, session_id: str, log: logging.Logger) -> None:
+    orb_cfg = getattr(cfg.strategy, "orb_variant_a", None)
+    tz_name = getattr(orb_cfg, "timezone", "UTC") if orb_cfg else "UTC"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        log.warning("invalid_strategy_timezone", extra={"timezone": tz_name})
+        tz = ZoneInfo("UTC")
+
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(tz)
+
+    range_start = getattr(getattr(orb_cfg, "range_window", None), "start", None)
+    range_end = getattr(getattr(orb_cfg, "range_window", None), "end", None)
+    entry_start = getattr(getattr(orb_cfg, "entry_window", None), "start", None)
+    entry_end = getattr(getattr(orb_cfg, "entry_window", None), "end", None)
+    flat_time = getattr(orb_cfg, "flat_time", None)
+
+    range_start_time = _parse_hhmm(range_start)
+    range_end_time = _parse_hhmm(range_end)
+    entry_start_time = _parse_hhmm(entry_start)
+    entry_end_time = _parse_hhmm(entry_end)
+
+    in_range = _is_in_window(now_local, range_start_time, range_end_time)
+    in_entry = _is_in_window(now_local, entry_start_time, entry_end_time)
+    entry_passed = None
+    if entry_end_time:
+        entry_passed = now_local.timetz().replace(tzinfo=None) > entry_end_time
+
+    day_local = now_local.date().isoformat()
+    range_built = False
+    db = Database(cfg.storage.sqlite_path)
+    try:
+        range_built = _range_built_for_day(db, day_local, cfg.instrument.symbol, cfg.strategy.type)
+    finally:
+        db.close()
+
+    preflight = {
+        "session_id": session_id,
+        "now_utc": now_utc.isoformat(),
+        "now_strategy_tz": now_local.isoformat(),
+        "strategy_timezone": tz_name,
+        "range_window_start": range_start,
+        "range_window_end": range_end,
+        "in_range_window": in_range,
+        "entry_window_start": entry_start,
+        "entry_window_end": entry_end,
+        "in_entry_window": in_entry,
+        "entry_window_passed": entry_passed,
+        "flat_time": flat_time,
+        "range_built_today": range_built,
+        "range_day": day_local,
+    }
+    log.info("trial_preflight", extra=preflight)
+    _append_trial_log(f"preflight {json.dumps(preflight, ensure_ascii=True)}")
+
+    if entry_passed:
+        msg = "Entry window already passed; signals may remain 0"
+        log.info(msg)
+        _append_trial_log(f"INFO: {msg}")
+
+
 def _read_counts(db: Database, symbol: str, strategy: str) -> dict[str, int]:
     conn = db.conn
 
@@ -640,6 +736,7 @@ def report(
 def trial(
     config: str = typer.Option(..., "--config", "-c"),
     iterations: int = typer.Option(3600, "--iterations", "-n"),
+    minutes: Optional[int] = typer.Option(None, "--minutes", help="Override iterations based on minutes of runtime"),
     outdir: str = typer.Option("run/trials", "--outdir"),
     export_days: int = typer.Option(14, "--export-days"),
     symbol: Optional[str] = typer.Option(None, "--symbol", help="Override symbol for sanity checks/export/report"),
@@ -656,16 +753,24 @@ def trial(
     log = logging.getLogger("trial")
     sym = symbol or cfg.instrument.symbol
     strategy = cfg.strategy.type
+    hb_seconds = cfg.runtime.heartbeat_seconds
+    iterations_to_use = iterations
+    if minutes is not None:
+        if hb_seconds <= 0:
+            log.warning("invalid_heartbeat_seconds_for_minutes", extra={"heartbeat_seconds": hb_seconds, "minutes": minutes})
+        else:
+            iterations_to_use = int(minutes * 60 / hb_seconds)
     session_id = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{sym}_{strategy}_{cfg.runtime.instance_id}"
     _append_trial_log(
-        f"trial_start session_id={session_id} config={config} symbol={sym} iterations={iterations} outdir={outdir} export_days={export_days}"
+        f"trial_start session_id={session_id} config={config} symbol={sym} iterations={iterations_to_use} minutes={minutes} outdir={outdir} export_days={export_days}"
     )
+    _trial_preflight(cfg, session_id, log)
 
     before_counts = _collect_counts(cfg.storage.sqlite_path, sym, strategy)
     log.info("before_counts", extra=before_counts)
     _append_trial_log(f"before_counts {before_counts}")
 
-    _trial_runner(cfg, iterations)
+    _trial_runner(cfg, iterations_to_use)
 
     after_counts = _collect_counts(cfg.storage.sqlite_path, sym, strategy)
     delta_counts = {k: after_counts.get(k, 0) - before_counts.get(k, 0) for k in after_counts}

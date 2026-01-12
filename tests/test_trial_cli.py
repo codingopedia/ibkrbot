@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 
 import yaml
@@ -11,7 +12,8 @@ from trader.persistence.db import Database
 runner = CliRunner()
 
 
-def test_trial_refuses_when_trading_enabled_true(tmp_path) -> None:
+def test_trial_refuses_when_trading_enabled_true(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
     cfg_path = tmp_path / "cfg.yaml"
     db_path = tmp_path / "db.sqlite"
     cfg_path.write_text(
@@ -32,7 +34,41 @@ def test_trial_refuses_when_trading_enabled_true(tmp_path) -> None:
     assert "trial is read-only; set trading.enabled=false" in result.output
 
 
+def test_trial_minutes_overrides_iterations(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    cfg_path = tmp_path / "cfg.yaml"
+    db_path = tmp_path / "db.sqlite"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "env": "paper",
+                "storage": {"sqlite_path": str(db_path)},
+                "runtime": {"heartbeat_seconds": 2},
+                "trading": {"enabled": False},
+                "strategy": {"type": "orb_variant_a"},
+                "instrument": {"symbol": "ES"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    db = Database(db_path.as_posix())
+    db.close()
+
+    captured = {}
+
+    def _fake_runner(cfg, iterations):
+        captured["iterations"] = iterations
+
+    monkeypatch.setattr("trader.main._trial_runner", _fake_runner)
+
+    result = runner.invoke(app, ["trial", "-c", str(cfg_path), "--minutes", "3"])
+    assert result.exit_code == 0, result.output
+    assert captured["iterations"] == int(3 * 60 / 2)
+
+
 def test_trial_creates_report_and_export_files(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
     cfg_path = tmp_path / "cfg.yaml"
     db_path = tmp_path / "db.sqlite"
     outdir = tmp_path / "out"
@@ -137,3 +173,66 @@ def test_trial_creates_report_and_export_files(tmp_path, monkeypatch) -> None:
     assert reports, "expected report JSON"
     assert exports, "expected CSV exports"
     assert all(p.name.startswith(session_id) for p in exports)
+
+
+def test_trial_preflight_logs_windows(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    cfg_path = tmp_path / "cfg.yaml"
+    db_path = tmp_path / "db.sqlite"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "env": "paper",
+                "storage": {"sqlite_path": str(db_path)},
+                "trading": {"enabled": False},
+                "strategy": {
+                    "type": "orb_variant_a",
+                    "orb_variant_a": {
+                        "timezone": "UTC",
+                        "range_window": {"start": "06:00", "end": "07:00"},
+                        "entry_window": {"start": "07:00", "end": "07:30"},
+                        "flat_time": "08:00",
+                    },
+                },
+                "instrument": {"symbol": "ES"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    db = Database(db_path.as_posix())
+    today = datetime.now(timezone.utc).date().isoformat()
+    db.upsert_strategy_daily(
+        day=today,
+        symbol="ES",
+        strategy="orb_variant_a",
+        timezone="UTC",
+        range_start="06:00",
+        range_end="07:00",
+        entry_start="07:00",
+        entry_end="07:30",
+        range_high=10.0,
+        range_low=5.0,
+        range_bars=3,
+        signals_count=0,
+        entries_count=0,
+        exits_count=0,
+        trades_closed_count=0,
+        notes_json=None,
+    )
+    db.close()
+
+    monkeypatch.setattr("trader.main._trial_runner", lambda cfg, iterations: None)
+
+    result = runner.invoke(app, ["trial", "-c", str(cfg_path), "--iterations", "1"])
+    assert result.exit_code == 0, result.output
+
+    log_path = tmp_path / "run" / "trial_build.log"
+    assert log_path.exists()
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    preflight_line = next(line for line in lines if line.startswith("preflight "))
+    payload = json.loads(preflight_line.split(" ", 1)[1])
+    assert payload["range_window_start"] == "06:00"
+    assert payload["entry_window_start"] == "07:00"
+    assert payload["flat_time"] == "08:00"
+    assert payload["range_built_today"] is True
